@@ -1,1 +1,8 @@
 app/env
+app/hello_django/__pycache__
+*.pyc
+__pycache
+.DS_Store
+.env.dev
+.env.prod
+.env.prod.db

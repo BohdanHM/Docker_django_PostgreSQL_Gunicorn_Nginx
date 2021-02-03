@@ -114,7 +114,7 @@ This project tells how to configure Django and Postgres to run on Docker.
   ```
 * Update the file permissions:
   ```sh
-$ chmod +x app/entrypoint.sh
+  chmod +x app/entrypoint.sh
   ```
 * Add a docker-compose.yml file to the project root:
   ```sh
@@ -168,15 +168,41 @@ Instead, you can run them manually, after the containers spin up, like so:
   docker-compose exec web python manage.py migrate
   ```
 ## Production
-**Gunicorn**
-
-**requirements file:**
+In production uses gunicorn + nginx.
+Add Gunicorn in **requirements.txt** file:
 ```sh
 Django==3.0.7
 gunicorn==20.0.4
 psycopg2-binary==2.8.5
 ```
+**Nginx config:**
+```sh
+upstream hello_django {
+  server web:8000;
+}
 
+server {
+
+  listen 80;
+
+  location / {
+      proxy_pass http://hello_django;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header Host $host;
+      proxy_redirect off;
+      client_max_body_size 100M;
+  }
+
+  location /staticfiles/ {
+      alias /home/app/web/staticfiles/;
+  }
+
+  location /mediafiles/ {
+      alias /home/app/web/mediafiles/;
+  }
+
+}
+```
 **docker-compose.prod.yml**
   ```sh
   version: '3.7'
@@ -201,7 +227,7 @@ psycopg2-binary==2.8.5
   volumes:
     postgres_data:
     ```
-  **.env.prod:**
+**.env.prod:**
   ```sh
   DEBUG=0
   SECRET_KEY=change_me
@@ -214,90 +240,66 @@ psycopg2-binary==2.8.5
   SQL_PORT=5432
   DATABASE=postgres
   ```
-  **.env.prod.db:**
+**.env.prod.db:**
   ```sh
   POSTGRES_USER=hello_django
   POSTGRES_PASSWORD=hello_django
   POSTGRES_DB=hello_django_prod
   ```
-##Production Dockerfile
+
+**Dockerfile**
 ```sh
-###########
-# BUILDER #
-###########
+  FROM python:3.8.3-alpine as builder
 
-# pull official base image
-FROM python:3.8.3-alpine as builder
+  WORKDIR /usr/src/app
 
-# set work directory
-WORKDIR /usr/src/app
+  ENV PYTHONDONTWRITEBYTECODE 1
+  ENV PYTHONUNBUFFERED 1
 
-# set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+  RUN apk update \
+      && apk add postgresql-dev gcc python3-dev musl-dev
 
-# install psycopg2 dependencies
-RUN apk update \
-    && apk add postgresql-dev gcc python3-dev musl-dev
+  RUN pip install --upgrade pip
+  RUN pip install flake8
+  COPY . .
+  RUN flake8 --ignore=E501,F401 .
 
-# lint
-RUN pip install --upgrade pip
-RUN pip install flake8
-COPY . .
-RUN flake8 --ignore=E501,F401 .
-
-# install dependencies
-COPY ./requirements.txt .
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /usr/src/app/wheels -r requirements.txt
+  COPY ./requirements.txt .
+  RUN pip wheel --no-cache-dir --no-deps --wheel-dir /usr/src/app/wheels -r requirements.txt
 
 
-#########
-# FINAL #
-#########
+  FROM python:3.8.3-alpine
 
-# pull official base image
-FROM python:3.8.3-alpine
+  RUN mkdir -p /home/app
 
-# create directory for the app user
-RUN mkdir -p /home/app
+  RUN addgroup -S app && adduser -S app -G app
 
-# create the app user
-RUN addgroup -S app && adduser -S app -G app
+  ENV HOME=/home/app
+  ENV APP_HOME=/home/app/web
+  RUN mkdir $APP_HOME
+  WORKDIR $APP_HOME
 
-# create the appropriate directories
-ENV HOME=/home/app
-ENV APP_HOME=/home/app/web
-RUN mkdir $APP_HOME
-WORKDIR $APP_HOME
+  RUN apk update && apk add libpq
+  COPY --from=builder /usr/src/app/wheels /wheels
+  COPY --from=builder /usr/src/app/requirements.txt .
+  RUN pip install --no-cache /wheels/*
 
-# install dependencies
-RUN apk update && apk add libpq
-COPY --from=builder /usr/src/app/wheels /wheels
-COPY --from=builder /usr/src/app/requirements.txt .
-RUN pip install --no-cache /wheels/*
+  COPY ./entrypoint.prod.sh $APP_HOME
 
-# copy entrypoint-prod.sh
-COPY ./entrypoint.prod.sh $APP_HOME
+  COPY . $APP_HOME
 
-# copy project
-COPY . $APP_HOME
+  RUN chown -R app:app $APP_HOME
 
-# chown all the files to the app user
-RUN chown -R app:app $APP_HOME
+  USER app
 
-# change to the app user
-USER app
+  ENV HOME=/home/app
+  ENV APP_HOME=/home/app/web
+  RUN mkdir $APP_HOME
+  RUN mkdir $APP_HOME/staticfiles
+  RUN mkdir $APP_HOME/mediafiles
+  WORKDIR $APP_HOME
 
-# create the appropriate directories
-ENV HOME=/home/app
-ENV APP_HOME=/home/app/web
-RUN mkdir $APP_HOME
-RUN mkdir $APP_HOME/staticfiles
-RUN mkdir $APP_HOME/mediafiles
-WORKDIR $APP_HOME
-
-# run entrypoint.prod.sh
-ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
+  ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
 ```
 **entrypoint.prod.sh:**
 ```sh
@@ -318,69 +320,145 @@ exec "$@"
 ```
 **docker-compose.prod.yml**
 ```sh
-version: '3.7'
+  version: '3.7'
 
-services:
-  web:
-    build:
-      context: ./app
-      dockerfile: Dockerfile.prod
-    command: gunicorn hello_django.wsgi:application --bind 0.0.0.0:8000
-    volumes:
-      - static_volume:/home/app/web/staticfiles
-      - media_volume:/home/app/web/mediafiles
-    expose:
-      - 8000
-    env_file:
-      - ./.env.prod
-    depends_on:
-      - db
-  db:
-    image: postgres:12.0-alpine
-    volumes:
-      - postgres_data:/var/lib/postgresql/data/
-    env_file:
-      - ./.env.prod.db
-  nginx:
-    build: ./nginx
-    volumes:
-      - static_volume:/home/app/web/staticfiles
-      - media_volume:/home/app/web/mediafiles
-    ports:
-      - 1337:80
-    depends_on:
-      - web
+  services:
+    web:
+      build:
+        context: ./app
+        dockerfile: Dockerfile.prod
+      command: gunicorn hello_django.wsgi:application --bind 0.0.0.0:8000
+      volumes:
+        - static_volume:/home/app/web/staticfiles
+        - media_volume:/home/app/web/mediafiles
+      expose:
+        - 8000
+      env_file:
+        - ./.env.prod
+      depends_on:
+        - db
+    db:
+      image: postgres:12.0-alpine
+      volumes:
+        - postgres_data:/var/lib/postgresql/data/
+      env_file:
+        - ./.env.prod.db
+    nginx:
+      build: ./nginx
+      volumes:
+        - static_volume:/home/app/web/staticfiles
+        - media_volume:/home/app/web/mediafiles
+      ports:
+        - 1337:80
+      depends_on:
+        - web
 
-volumes:
-  postgres_data:
-  static_volume:
-  media_volume:
-  ```
-  **Nginx config:**
-  ```sh
-  upstream hello_django {
-    server web:8000;
-}
-
-server {
-
-    listen 80;
-
-    location / {
-        proxy_pass http://hello_django;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header Host $host;
-        proxy_redirect off;
-        client_max_body_size 100M;
-    }
-
-    location /staticfiles/ {
-        alias /home/app/web/staticfiles/;
-    }
-
-    location /mediafiles/ {
-        alias /home/app/web/mediafiles/;
-    }
-
-}
+  volumes:
+    postgres_data:
+    static_volume:
+    media_volume:
 ```
+Project structure should look like:
+```sh
+  ├── .env.prod
+  ├── .env.prod.db
+  ├── .gitignore
+  ├── app
+  │   ├── Dockerfile
+  │   ├── Dockerfile.prod
+  │   ├── entrypoint.prod.sh
+  │   ├── entrypoint.sh
+  │   ├── hello_django
+  │   │   ├── __init__.py
+  │   │   ├── asgi.py
+  │   │   ├── settings.py
+  │   │   ├── urls.py
+  │   │   └── wsgi.py
+  │   ├── manage.py
+  │   └── requirements.txt
+  ├── docker-compose.prod.yml
+  ├── docker-compose.yml
+  └── nginx
+      ├── Dockerfile
+      └── nginx.conf
+```
+### Static Files
+**settings.py:**
+```sh
+  STATIC_URL = "/staticfiles/"
+  STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
+```
+### Media Files
+**settings.py:**
+```sh
+  INSTALLED_APPS = [
+      "django.contrib.admin",
+      "django.contrib.auth",
+      "django.contrib.contenttypes",
+      "django.contrib.sessions",
+      "django.contrib.messages",
+      "django.contrib.staticfiles",
+
+      "upload",
+  ]
+```
+**app/upload/views.py:**
+```sh
+  from django.shortcuts import render
+  from django.core.files.storage import FileSystemStorage
+
+
+  def image_upload(request):
+      if request.method == "POST" and request.FILES["image_file"]:
+          image_file = request.FILES["image_file"]
+          fs = FileSystemStorage()
+          filename = fs.save(image_file.name, image_file)
+          image_url = fs.url(filename)
+          print(image_url)
+          return render(request, "upload.html", {
+              "image_url": image_url
+          })
+      return render(request, "upload.html")
+```
+Add a new template **upload.html**:
+```sh
+  from django.shortcuts import render
+  from django.core.files.storage import FileSystemStorage
+
+
+  def image_upload(request):
+      if request.method == "POST" and request.FILES["image_file"]:
+          image_file = request.FILES["image_file"]
+          fs = FileSystemStorage()
+          filename = fs.save(image_file.name, image_file)
+          image_url = fs.url(filename)
+          print(image_url)
+          return render(request, "upload.html", {
+              "image_url": image_url
+          })
+      return render(request, "upload.html")
+```
+**app/hello_django/urls.py:**
+```sh
+  from django.contrib import admin
+  from django.urls import path
+  from django.conf import settings
+  from django.conf.urls.static import static
+
+  from upload.views import image_upload
+
+  urlpatterns = [
+      path("", image_upload, name="upload"),
+      path("admin/", admin.site.urls),
+  ]
+
+  if bool(settings.DEBUG):
+      urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+```
+
+**app/hello_django/settings.py:**
+```sh
+  MEDIA_URL = "/mediafiles/"
+  MEDIA_ROOT = os.path.join(BASE_DIR, "mediafiles")
+```
+  ### Development
